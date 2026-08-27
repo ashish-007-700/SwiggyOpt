@@ -1,0 +1,1 @@
+"""SwiggyOpt application package."""
