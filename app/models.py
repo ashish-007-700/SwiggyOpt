@@ -183,7 +183,7 @@ class CandidateFilters(BaseModel):
     min_menu_price: float | None = Field(default=None, ge=0)
     max_menu_price: float | None = Field(default=None, ge=0)
     category: str | None = Field(default=None, min_length=1)
-    require_name_token_match: bool = False
+    require_name_token_match: bool = True
     max_restaurants: int = Field(default=8, ge=1, le=20)
     max_variant_combinations_per_item: int = Field(default=24, ge=1, le=100)
 

@@ -126,6 +126,81 @@ async def exchange_code(*, code: str, verifier: str) -> tuple[str, float]:
     return access_token, time.monotonic() + expires_in
 
 
+    return access_token, time.monotonic() + expires_in
+
+
+def unwrap_exception(exc: BaseException) -> BaseException:
+    """Recursively unwrap ExceptionGroup / TaskGroup / chained exceptions to retrieve the root cause."""
+    current = exc
+    visited = set()
+    while current and id(current) not in visited:
+        visited.add(id(current))
+        if hasattr(current, "exceptions") and getattr(current, "exceptions"):
+            exceptions = getattr(current, "exceptions")
+            if exceptions:
+                current = exceptions[0]
+                continue
+        if getattr(current, "__cause__", None) is not None:
+            current = current.__cause__  # type: ignore
+            continue
+        if getattr(current, "__context__", None) is not None:
+            current = current.__context__  # type: ignore
+            continue
+        break
+    return current or exc
+
+
+def _collect_leaf_exceptions(exc: BaseException) -> list[BaseException]:
+    """Collect all leaf exceptions from an exception chain, including all ExceptionGroup members."""
+    leaves: list[BaseException] = []
+    visited: set[int] = set()
+
+    def walk(e: BaseException) -> None:
+        if id(e) in visited:
+            return
+        visited.add(id(e))
+        if hasattr(e, "exceptions") and getattr(e, "exceptions"):
+            for sub in getattr(e, "exceptions"):
+                walk(sub)
+            return
+        if getattr(e, "__cause__", None) is not None:
+            walk(e.__cause__)  # type: ignore
+            return
+        if getattr(e, "__context__", None) is not None:
+            walk(e.__context__)  # type: ignore
+            return
+        leaves.append(e)
+
+    walk(exc)
+    return leaves or [exc]
+
+
+def is_auth_error(exc: BaseException) -> bool:
+    """Return True if the exception or any of its unpacked causes is a 401 Unauthorized error.
+
+    The Swiggy MCP SDK wraps httpx transport errors in a generic message
+    ("Server returned an error response") that strips the HTTP status code.
+    When this happens, it nearly always means the Swiggy access token has
+    expired or been revoked, so we treat it as an auth error to prompt
+    re-authentication rather than showing a confusing 502.
+    """
+    for leaf in _collect_leaf_exceptions(exc):
+        status_code = getattr(leaf, "status_code", None)
+        if status_code is None and hasattr(leaf, "response"):
+            status_code = getattr(getattr(leaf, "response"), "status_code", None)
+        if status_code == 401:
+            return True
+        msg = str(leaf)
+        if "401" in msg or "Unauthorized" in msg or "unauthorized" in msg:
+            return True
+        # The MCP SDK's streamable HTTP client strips the HTTP status code and
+        # raises a generic "Server returned an error response" when the Swiggy
+        # server rejects the request.  This is almost always a token expiry.
+        if msg == "Server returned an error response":
+            return True
+    return False
+
+
 async def call_food_tool(access_token: str, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     """Call one Food MCP tool through the official MCP Python SDK."""
     headers = {"Authorization": f"Bearer {access_token}"}
@@ -144,8 +219,11 @@ async def call_food_tool(access_token: str, name: str, arguments: dict[str, Any]
                     result = await mcp_session.call_tool(name, arguments=arguments)
         return result.model_dump(mode="json")
     except Exception as exc:
-        logger.error("call_food_tool failed for tool '%s': %s", name, exc)
-        raise HTTPException(status_code=502, detail=f"Swiggy Food MCP tool '{name}' failed: {exc}") from exc
+        root_exc = unwrap_exception(exc)
+        logger.error("call_food_tool failed for tool '%s': %s (root cause: %s)", name, exc, root_exc)
+        if is_auth_error(exc):
+            raise HTTPException(status_code=401, detail="Swiggy authentication has expired. Authenticate again.") from exc
+        raise HTTPException(status_code=502, detail=f"Swiggy Food MCP tool '{name}' failed: {root_exc}") from exc
 
 
 async def get_addresses(access_token: str) -> dict[str, Any]:
@@ -218,7 +296,9 @@ async def addresses_for(session: AuthenticatedSession) -> list[DeliveryAddress]:
         if not isinstance(raw_addresses, list):
             raise HTTPException(status_code=502, detail="Swiggy returned an invalid address list.")
         return [DeliveryAddress.model_validate(address) for address in raw_addresses]
-    except httpx2.HTTPStatusError as exc:
+    except HTTPException:
+        raise
+    except (httpx2.HTTPStatusError, httpx.HTTPStatusError) as exc:
         if exc.response.status_code == 401:
             raise HTTPException(status_code=401, detail="Swiggy authentication has expired. Authenticate again.") from exc
         raise HTTPException(status_code=502, detail="Swiggy could not retrieve saved addresses.") from exc
@@ -230,10 +310,13 @@ async def food_data_for(session: AuthenticatedSession, name: str, arguments: dic
     """Call Food MCP and make expired Swiggy credentials an actionable API error."""
     try:
         return swiggy_data(await call_food_tool(session.access_token, name, arguments))
-    except httpx2.HTTPStatusError as exc:
+    except HTTPException:
+        raise
+    except (httpx2.HTTPStatusError, httpx.HTTPStatusError) as exc:
         if exc.response.status_code == 401:
             raise HTTPException(status_code=401, detail="Swiggy authentication has expired. Authenticate again.") from exc
         raise HTTPException(status_code=502, detail=f"Swiggy Food MCP request failed (HTTP {exc.response.status_code}).") from exc
+
 
 
 def menu_item_from_raw(raw_item: dict[str, Any]) -> MenuItem:
@@ -897,8 +980,8 @@ async def evaluate_candidates(request: Request, payload: EvaluateRequest) -> Eva
     )
 
 
-@app.get("/callback", response_class=HTMLResponse)
-async def callback(request: Request, code: str | None = None, state: str | None = None) -> HTMLResponse:
+@app.get("/callback", response_class=RedirectResponse)
+async def callback(request: Request, code: str | None = None, state: str | None = None) -> RedirectResponse:
     expected_state = request.session.pop("oauth_state", None)
     pending = pending_auth.pop(state, None) if state else None
     if not code or not state or not expected_state or not pending:
@@ -911,8 +994,7 @@ async def callback(request: Request, code: str | None = None, state: str | None 
 
     try:
         access_token, token_expires_at = await exchange_code(code=code, verifier=verifier)
-        result = await get_addresses(access_token)
-    except httpx.HTTPStatusError as exc:
+    except (httpx.HTTPStatusError, httpx2.HTTPStatusError) as exc:
         # Do not include OAuth response contents, which could contain sensitive data.
         raise HTTPException(status_code=502, detail=f"Swiggy rejected the request (HTTP {exc.response.status_code}).") from exc
     except Exception as exc:
@@ -922,11 +1004,5 @@ async def callback(request: Request, code: str | None = None, state: str | None 
     authenticated_sessions[authenticated_session_id] = AuthenticatedSession(access_token, token_expires_at)
     request.session["authenticated_session_id"] = authenticated_session_id
 
-    import json
-    safe_result = html.escape(json.dumps(result, indent=2, ensure_ascii=False))
-    return page(
-        "Authenticated Swiggy Food MCP response",
-        "<p>Successfully completed OAuth and called the read-only <code>get_addresses</code> tool.</p>"
-        "<p>Select an address with <code>PUT /api/addresses/selected</code> before requesting a menu.</p>"
-        f"<pre>{safe_result}</pre>",
-    )
+    return RedirectResponse(url=FRONTEND_ORIGIN, status_code=302)
+
