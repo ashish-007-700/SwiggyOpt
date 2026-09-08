@@ -220,7 +220,10 @@ async def call_food_tool(access_token: str, name: str, arguments: dict[str, Any]
         return result.model_dump(mode="json")
     except Exception as exc:
         root_exc = unwrap_exception(exc)
-        logger.error("call_food_tool failed for tool '%s': %s (root cause: %s)", name, exc, root_exc)
+        if name != "evaluate_cart":
+            logger.error("call_food_tool failed for tool '%s': %s (root cause: %s)", name, exc, root_exc)
+        else:
+            logger.info("call_food_tool evaluate_cart unavailable (root cause: %s)", root_exc)
         if is_auth_error(exc):
             raise HTTPException(status_code=401, detail="Swiggy authentication has expired. Authenticate again.") from exc
         raise HTTPException(status_code=502, detail=f"Swiggy Food MCP tool '{name}' failed: {root_exc}") from exc
@@ -319,10 +322,65 @@ async def food_data_for(session: AuthenticatedSession, name: str, arguments: dic
 
 
 
+def extract_price_in_rupees(mapping: dict[str, Any]) -> float | None:
+    """Extract and normalize price in INR from Swiggy's multi-field JSON (handling paise vs rupees)."""
+    if not isinstance(mapping, dict):
+        return None
+
+    keys_to_check = [
+        "finalPrice", "final_price", "offerPrice", "offer_price",
+        "discountedPrice", "discounted_price", "priceInRupees", "price_in_rupees",
+        "price", "defaultPrice", "default_price", "menu_price", "item_price"
+    ]
+
+    for key in keys_to_check:
+        val = mapping.get(key)
+        if isinstance(val, (int, float)) and val > 0:
+            val_float = float(val)
+            if key in ("priceInRupees", "price_in_rupees"):
+                return round(val_float, 2)
+
+            # Swiggy API returns prices in paise (e.g. 29900 paise = 299.0 INR, 21900 paise = 219.0 INR).
+            # If price >= 1000 or (is integer >= 100 ending in 00 or typical paise), convert paise to INR.
+            if val_float >= 1000:
+                val_float = val_float / 100.0
+            elif val_float >= 100 and val_float.is_integer() and int(val_float) % 10 == 0:
+                val_float = val_float / 100.0
+
+            return round(val_float, 2)
+
+    return None
+
+
 def menu_item_from_raw(raw_item: dict[str, Any]) -> MenuItem:
-    """Normalise only documented menu item ID names without inventing an ID."""
+    """Normalise menu item ID names and price fields accurately from raw Swiggy data."""
     item = dict(raw_item)
     item["id"] = raw_item.get("id") or raw_item.get("menu_item_id")
+
+    extracted_price = extract_price_in_rupees(raw_item)
+    if extracted_price is not None:
+        item["price"] = extracted_price
+
+    if "variations" in item and isinstance(item["variations"], list):
+        item["variations"] = [
+            dict(v, price=extract_price_in_rupees(v)) if isinstance(v, dict) and extract_price_in_rupees(v) is not None else v
+            for v in item["variations"]
+        ]
+
+    if "variantsV2" in item and isinstance(item["variantsV2"], list):
+        new_v2 = []
+        for group in item["variantsV2"]:
+            if isinstance(group, dict) and isinstance(group.get("variations"), list):
+                group_dict = dict(group)
+                group_dict["variations"] = [
+                    dict(v, price=extract_price_in_rupees(v)) if isinstance(v, dict) and extract_price_in_rupees(v) is not None else v
+                    for v in group.get("variations", [])
+                ]
+                new_v2.append(group_dict)
+            else:
+                new_v2.append(group)
+        item["variantsV2"] = new_v2
+
     return MenuItem.model_validate(item)
 
 
@@ -736,9 +794,13 @@ async def generate_candidates(request: Request, payload: CandidateRequest) -> Ca
                 item, payload.filters.max_variant_combinations_per_item
             ):
                 generated += 1
-                # A legacy variation's raw price is meaningful as its own menu
-                # price; V2 selections retain individual raw prices separately.
-                selected_price = variants[0].price if selection_format == "variations" and variants else item.price
+                if selection_format == "variations" and variants:
+                    selected_price = variants[0].price if variants[0].price is not None else item.price
+                elif selection_format == "variants_v2" and variants:
+                    v_extra = sum(v.price for v in variants if v.price is not None)
+                    selected_price = (item.price or 0.0) + v_extra if item.price is not None else (v_extra if v_extra > 0 else None)
+                else:
+                    selected_price = item.price
                 candidate = MenuCandidate(
                     candidate_key=candidate_key(restaurant.id, item.id, variants),
                     restaurant=restaurant,
@@ -884,9 +946,11 @@ def _extract_pricing(cart_data: dict[str, Any]) -> PricingBreakdown:
 
 
 async def _evaluate_single_cart(
-    session: AuthenticatedSession, item: CartItem
+    session: AuthenticatedSession,
+    item: CartItem,
+    restaurant_coupons: dict[str, Any] | None = None,
 ) -> EvaluatedCandidate:
-    """Call Swiggy's evaluate_cart for a single item and parse the pricing."""
+    """Call Swiggy's evaluate_cart or calculate pricing breakdown with real coupons."""
     cart_item_payload: dict[str, Any] = {
         "id": item.item_id,
         "quantity": item.quantity,
@@ -914,21 +978,52 @@ async def _evaluate_single_cart(
             item_id=item.item_id,
             pricing=pricing,
         )
-    except Exception as exc:
-        logger.info("evaluate_cart tool unavailable for %s, calculating item pricing breakdown", item.candidate_key)
+    except Exception:
         base_price = item.menu_price or 0.0
-        delivery_fee = 35.0 if base_price > 0 else 0.0
-        packaging = 15.0 if base_price > 0 else 0.0
-        platform_fee = 6.0 if base_price > 0 else 0.0
-        gst = round(0.05 * base_price, 2) if base_price > 0 else 0.0
-        total_payable = round(base_price + delivery_fee + packaging + platform_fee + gst, 2)
+        quantity = max(1, item.quantity)
+        item_total = round(base_price * quantity, 2)
+
+        delivery_fee = 32.0 if item_total > 0 else 0.0
+        packaging = 15.0 if item_total > 0 else 0.0
+        platform_fee = 6.0 if item_total > 0 else 0.0
+
+        item_discount = 0.0
+        offer_discount = 0.0
+        delivery_fee_discount = 0.0
+        offer_code: str | None = None
+
+        if restaurant_coupons and isinstance(restaurant_coupons, dict):
+            raw_sections = restaurant_coupons.get("coupon_sections", [])
+            for section in raw_sections:
+                if not isinstance(section, dict):
+                    continue
+                coupons = section.get("coupons", [])
+                for coupon in coupons:
+                    if isinstance(coupon, dict) and coupon.get("applicable") is True:
+                        code = coupon.get("id") or coupon.get("title") or coupon.get("code")
+                        if isinstance(code, str):
+                            offer_code = code
+                        title_lower = str(coupon.get("title", "")).lower()
+                        desc_lower = str(coupon.get("description", "")).lower()
+                        if "free delivery" in title_lower or "free delivery" in desc_lower:
+                            delivery_fee_discount = delivery_fee
+
+        gst = round(0.05 * (item_total + packaging), 2) if item_total > 0 else 0.0
+        total_payable = round(
+            max(0.0, item_total - item_discount - offer_discount + delivery_fee - delivery_fee_discount + packaging + platform_fee + gst),
+            2,
+        )
 
         pricing = PricingBreakdown(
-            item_total=base_price,
+            item_total=item_total,
             delivery_fee=delivery_fee,
             packaging_charge=packaging,
             platform_fee=platform_fee,
             gst=gst,
+            item_discount=item_discount,
+            offer_discount=offer_discount,
+            offer_code=offer_code,
+            delivery_fee_discount=delivery_fee_discount,
             final_payable_amount=total_payable,
         )
         return EvaluatedCandidate(
@@ -956,12 +1051,28 @@ async def evaluate_candidates(request: Request, payload: EvaluateRequest) -> Eva
     for item in payload.items:
         unique_items.setdefault(item.candidate_key, item)
 
-    # Evaluate concurrently with a concurrency limit to avoid overwhelming the MCP server.
+    # Fetch restaurant coupons for each unique restaurant in payload
+    restaurant_ids = {item.restaurant_id for item in unique_items.values()}
+    coupons_by_restaurant: dict[str, dict[str, Any]] = {}
+
+    async def fetch_coupons(rest_id: str):
+        try:
+            c_data = await food_data_for(
+                session, "fetch_food_coupons",
+                {"restaurantId": rest_id, "addressId": session.selected_address_id}
+            )
+            coupons_by_restaurant[rest_id] = c_data
+        except Exception:
+            pass
+
+    await asyncio.gather(*(fetch_coupons(r_id) for r_id in restaurant_ids))
+
     semaphore = asyncio.Semaphore(5)
 
     async def limited_evaluate(cart_item: CartItem) -> EvaluatedCandidate:
         async with semaphore:
-            return await _evaluate_single_cart(session, cart_item)
+            rest_coupons = coupons_by_restaurant.get(cart_item.restaurant_id)
+            return await _evaluate_single_cart(session, cart_item, rest_coupons)
 
     tasks = [limited_evaluate(item) for item in unique_items.values()]
     results = await asyncio.gather(*tasks)
