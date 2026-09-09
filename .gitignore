@@ -30,6 +30,7 @@ frontend/.next/
 out/
 build/
 dist/
+*.tsbuildinfo
 
 # Logs
 *.log
