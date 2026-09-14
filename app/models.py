@@ -294,6 +294,18 @@ class PricingBreakdown(BaseModel):
     offer_code: str | None = None
     delivery_fee_discount: float = 0.0
     final_payable_amount: float = 0.0
+    # True whenever this breakdown was computed locally because Swiggy's
+    # evaluate_cart tool was unavailable, rather than being Swiggy's own
+    # confirmed checkout price. Frontends should surface this distinction
+    # instead of presenting an estimate as a real quote.
+    is_estimated: bool = True
+    pricing_source: str = "local_estimate"
+    # True whenever delivery_fee/packaging_charge/platform_fee/gst are 0.0
+    # because Swiggy exposed no real value for them (rather than 0.0 meaning
+    # they are genuinely free). Set only on the local-estimate path -- those
+    # fields are never fabricated, so this flags final_payable_amount as
+    # item cost only, excluding charges Swiggy would add at real checkout.
+    fees_unavailable: bool = False
 
 
 class EvaluatedCandidate(BaseModel):

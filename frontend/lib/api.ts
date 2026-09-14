@@ -72,6 +72,13 @@ export type PricingBreakdown = {
   offer_code?: string | null;
   delivery_fee_discount: number;
   final_payable_amount: number;
+  // True when Swiggy's real evaluate_cart pricing was unavailable and this
+  // breakdown was computed locally instead of being Swiggy's own quote.
+  is_estimated: boolean;
+  pricing_source: string;
+  // True when delivery_fee/packaging_charge/platform_fee/gst are 0 only
+  // because Swiggy gave us no real value for them, not because they're free.
+  fees_unavailable: boolean;
 };
 
 export type EvaluatedCandidate = {

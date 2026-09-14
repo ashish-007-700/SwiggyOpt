@@ -9,6 +9,7 @@ import hashlib
 import itertools
 import json as json_module
 import logging
+import re
 import secrets
 import time
 from typing import Any
@@ -57,6 +58,12 @@ from app.models import (
 )
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(_handler)
+    logger.propagate = False
 
 load_dotenv()
 
@@ -86,6 +93,14 @@ class AuthenticatedSession:
         self.access_token = access_token
         self.expires_at = expires_at
         self.selected_address_id: str | None = None
+        # Swiggy's Food MCP server does not tolerate concurrent streamable-HTTP
+        # tool calls on the same access token: observed in practice, concurrent
+        # calls fail with a generic "Server returned an error response" that
+        # is_auth_error() then misreads as a fully expired token, which was
+        # silently killing real coupon/menu data and forcing the local price
+        # estimate far more often than it should. Every Food MCP call for this
+        # session must go through this lock so Swiggy only ever sees one at a time.
+        self.mcp_lock = asyncio.Lock()
 
 
 async def register_client(redirect_uri: str) -> str:
@@ -310,9 +325,14 @@ async def addresses_for(session: AuthenticatedSession) -> list[DeliveryAddress]:
 
 
 async def food_data_for(session: AuthenticatedSession, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-    """Call Food MCP and make expired Swiggy credentials an actionable API error."""
+    """Call Food MCP and make expired Swiggy credentials an actionable API error.
+
+    Serialized per-session: Swiggy's MCP server does not tolerate concurrent
+    tool calls on one access token (see AuthenticatedSession.mcp_lock).
+    """
     try:
-        return swiggy_data(await call_food_tool(session.access_token, name, arguments))
+        async with session.mcp_lock:
+            return swiggy_data(await call_food_tool(session.access_token, name, arguments))
     except HTTPException:
         raise
     except (httpx2.HTTPStatusError, httpx.HTTPStatusError) as exc:
@@ -323,7 +343,23 @@ async def food_data_for(session: AuthenticatedSession, name: str, arguments: dic
 
 
 def extract_price_in_rupees(mapping: dict[str, Any]) -> float | None:
-    """Extract and normalize price in INR from Swiggy's multi-field JSON (handling paise vs rupees)."""
+    """Extract and normalize price in INR from Swiggy's multi-field JSON.
+
+    Verified in production: the paise-vs-rupees convention is NOT reliably
+    tied to the field name. get_restaurant_menu returned documented paise
+    values (29900 -> ₹299), but a live search_menu response for a different
+    restaurant returned a plain rupee value (300) through the same "price"
+    field -- unconditionally dividing that by 100 produced a ₹3 "Veg
+    Biryani", which is what actually shipped and was wrong.
+    There is no field-name signal that disambiguates this, so fall back to
+    what's actually plausible for a real dish: nothing Swiggy sells costs
+    ₹1-9.99, so a raw value below 1000 can only be a rupee amount already
+    (300 stays ₹300), while a raw value >=1000 is virtually always paise for
+    a normal-priced item (29900 -> ₹299). This can still misread a genuine
+    >=₹1000 combo/family-pack price as paise; there is no reliable way to
+    tell those apart from the number alone without Swiggy exposing units.
+    Only the explicitly *_in_rupees-named fields are unambiguous.
+    """
     if not isinstance(mapping, dict):
         return None
 
@@ -339,14 +375,8 @@ def extract_price_in_rupees(mapping: dict[str, Any]) -> float | None:
             val_float = float(val)
             if key in ("priceInRupees", "price_in_rupees"):
                 return round(val_float, 2)
-
-            # Swiggy API returns prices in paise (e.g. 29900 paise = 299.0 INR, 21900 paise = 219.0 INR).
-            # If price >= 1000 or (is integer >= 100 ending in 00 or typical paise), convert paise to INR.
             if val_float >= 1000:
                 val_float = val_float / 100.0
-            elif val_float >= 100 and val_float.is_integer() and int(val_float) % 10 == 0:
-                val_float = val_float / 100.0
-
             return round(val_float, 2)
 
     return None
@@ -555,7 +585,8 @@ async def list_addresses(request: Request) -> AddressListResponse:
     """List the authenticated user's addresses so one can be explicitly selected."""
     session = session_for(request)
     try:
-        tools = await _list_mcp_tools(session.access_token)
+        async with session.mcp_lock:
+            tools = await _list_mcp_tools(session.access_token)
         tool_summary = [{"name": t.get("name"), "description": t.get("description")} for t in tools if isinstance(t, dict)]
         logger.info("AVAILABLE SWIGGY MCP TOOLS SUMMARY: %s", json_module.dumps(tool_summary))
     except Exception as exc:
@@ -889,7 +920,8 @@ async def _list_mcp_tools(access_token: str) -> list[dict[str, Any]]:
 async def list_mcp_tools(request: Request) -> list[dict[str, Any]]:
     """Discover available Swiggy Food MCP tools (for development/debugging)."""
     session = session_for(request)
-    return await _list_mcp_tools(session.access_token)
+    async with session.mcp_lock:
+        return await _list_mcp_tools(session.access_token)
 
 
 def _extract_pricing(cart_data: dict[str, Any]) -> PricingBreakdown:
@@ -945,12 +977,107 @@ def _extract_pricing(cart_data: dict[str, Any]) -> PricingBreakdown:
     )
 
 
+# Deliberately no delivery-fee/packaging/platform-fee/GST constants here.
+# Swiggy sets those per-restaurant/per-order and exposes no MCP tool that
+# returns them outside evaluate_cart (which Swiggy's server doesn't expose
+# at all). A flat/tiered guess was tried here before and was wrong often
+# enough to be actively misleading -- see _evaluate_single_cart's fallback,
+# which now reports those charges as unavailable instead of inventing them.
+
+
+_FLAT_OFF_RE = re.compile(r"₹\s*([\d,]+(?:\.\d+)?)\s*(?:off|saved)", re.IGNORECASE)
+_PERCENT_OFF_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%\s*off", re.IGNORECASE)
+_MAX_CAP_RE = re.compile(r"up\s*to\s*₹\s*([\d,]+(?:\.\d+)?)", re.IGNORECASE)
+_MIN_ORDER_RE = re.compile(
+    r"(?:orders?\s+above|min(?:imum)?\s+order(?:\s+value)?(?:\s+of)?)\s*₹\s*([\d,]+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+_FREE_DELIVERY_RE = re.compile(r"free\s+delivery", re.IGNORECASE)
+
+
+def parse_coupon_benefit(
+    coupon: dict[str, Any], item_total: float, delivery_fee: float
+) -> tuple[float, float, float] | None:
+    """Estimate a coupon's real rupee benefit from its free-text title/description.
+
+    Swiggy's coupon API exposes no structured discount amount, only prose like
+    "Get ₹80 off on orders above ₹199" or "20% off up to ₹75". Returns
+    (item_discount, offer_discount, delivery_fee_discount) for this coupon if
+    it parses and the cart qualifies for its minimum order value, else None.
+    """
+    text = " ".join(str(coupon.get(field) or "") for field in ("title", "subtitle", "description"))
+
+    min_match = _MIN_ORDER_RE.search(text)
+    if min_match:
+        min_order = float(min_match.group(1).replace(",", ""))
+        if item_total < min_order:
+            return None
+
+    free_delivery = bool(_FREE_DELIVERY_RE.search(text))
+
+    cart_discount = 0.0
+    percent_match = _PERCENT_OFF_RE.search(text)
+    flat_match = _FLAT_OFF_RE.search(text)
+    if percent_match:
+        cart_discount = item_total * float(percent_match.group(1)) / 100.0
+        cap_match = _MAX_CAP_RE.search(text)
+        if cap_match:
+            cart_discount = min(cart_discount, float(cap_match.group(1).replace(",", "")))
+    elif flat_match:
+        cart_discount = float(flat_match.group(1).replace(",", ""))
+
+    if cart_discount <= 0 and not free_delivery:
+        return None
+
+    return (0.0, round(cart_discount, 2), delivery_fee if free_delivery else 0.0)
+
+
+# Swiggy's evaluate_cart tool is currently absent from its MCP server
+# ("Unknown tool: evaluate_cart"). Probed once per process rather than on
+# every request: if Swiggy ever renames or re-adds a real cart-pricing tool,
+# this picks it up automatically instead of silently staying on the local
+# estimate forever.
+_ALT_CART_PRICING_TOOL_RE = re.compile(
+    r"(cart|checkout).*(price|bill|evaluat|total)|(price|bill|evaluat|total).*(cart|checkout)",
+    re.IGNORECASE,
+)
+_alt_cart_pricing_tool_name: str | None = None
+_alt_cart_pricing_tool_probed = False
+
+
+async def _discover_alt_cart_pricing_tool(session: AuthenticatedSession) -> str | None:
+    """Look for a real cart-pricing MCP tool other than the unavailable evaluate_cart."""
+    global _alt_cart_pricing_tool_name, _alt_cart_pricing_tool_probed
+    if _alt_cart_pricing_tool_probed:
+        return _alt_cart_pricing_tool_name
+    _alt_cart_pricing_tool_probed = True
+    try:
+        async with session.mcp_lock:
+            tools = await _list_mcp_tools(session.access_token)
+        # Log the full raw list (name + description), not just regex matches,
+        # so it's possible to confirm from real data whether Swiggy genuinely
+        # exposes no cart-pricing tool at all, rather than guessing.
+        logger.info(
+            "FULL SWIGGY MCP TOOL LIST (checking for a real cart-pricing tool): %s",
+            json_module.dumps([{"name": t.get("name"), "description": t.get("description")} for t in tools if isinstance(t, dict)]),
+        )
+        for tool in tools:
+            name = tool.get("name")
+            if isinstance(name, str) and name != "evaluate_cart" and _ALT_CART_PRICING_TOOL_RE.search(name):
+                _alt_cart_pricing_tool_name = name
+                logger.info("Discovered alternate real cart-pricing MCP tool: %s", name)
+                break
+    except Exception as exc:
+        logger.warning("Could not probe MCP tools for an alternate cart-pricing tool: %s", exc)
+    return _alt_cart_pricing_tool_name
+
+
 async def _evaluate_single_cart(
     session: AuthenticatedSession,
     item: CartItem,
     restaurant_coupons: dict[str, Any] | None = None,
 ) -> EvaluatedCandidate:
-    """Call Swiggy's evaluate_cart or calculate pricing breakdown with real coupons."""
+    """Call Swiggy's evaluate_cart (or a rediscovered equivalent), else estimate locally."""
     cart_item_payload: dict[str, Any] = {
         "id": item.item_id,
         "quantity": item.quantity,
@@ -960,79 +1087,95 @@ async def _evaluate_single_cart(
             {"groupId": v.group_id, "variationId": v.variation_id}
             for v in item.variants
         ]
+    cart_request_args = {
+        "restaurantId": item.restaurant_id,
+        "addressId": session.selected_address_id,
+        "cartItems": [cart_item_payload],
+    }
 
-    try:
-        cart_data = await food_data_for(
-            session,
-            "evaluate_cart",
-            {
-                "restaurantId": item.restaurant_id,
-                "addressId": session.selected_address_id,
-                "cartItems": [cart_item_payload],
-            },
-        )
-        pricing = _extract_pricing(cart_data)
-        return EvaluatedCandidate(
-            candidate_key=item.candidate_key,
-            restaurant_id=item.restaurant_id,
-            item_id=item.item_id,
-            pricing=pricing,
-        )
-    except Exception:
-        base_price = item.menu_price or 0.0
-        quantity = max(1, item.quantity)
-        item_total = round(base_price * quantity, 2)
+    real_pricing_tool_names = ["evaluate_cart"]
+    alt_tool = await _discover_alt_cart_pricing_tool(session)
+    if alt_tool:
+        real_pricing_tool_names.append(alt_tool)
 
-        delivery_fee = 32.0 if item_total > 0 else 0.0
-        packaging = 15.0 if item_total > 0 else 0.0
-        platform_fee = 6.0 if item_total > 0 else 0.0
+    for tool_name in real_pricing_tool_names:
+        try:
+            cart_data = await food_data_for(session, tool_name, cart_request_args)
+            pricing = _extract_pricing(cart_data)
+            pricing.is_estimated = False
+            pricing.pricing_source = tool_name
+            return EvaluatedCandidate(
+                candidate_key=item.candidate_key,
+                restaurant_id=item.restaurant_id,
+                item_id=item.item_id,
+                pricing=pricing,
+            )
+        except Exception:
+            continue
+    # No real pricing tool succeeded. Swiggy exposes no tool that returns
+    # delivery fee, packaging charge, platform fee, or GST outside
+    # evaluate_cart, and those are set by Swiggy per-restaurant/per-order in
+    # ways we cannot reliably reproduce (a flat guess was previously shown
+    # here and was wrong often enough to be actively misleading). Report only
+    # what is actually verified: the real item price and any real, applicable
+    # coupon discount parsed from Swiggy's own coupon data. Everything this
+    # app cannot verify is left at zero rather than invented.
+    base_price = item.menu_price or 0.0
+    quantity = max(1, item.quantity)
+    item_total = round(base_price * quantity, 2)
 
-        item_discount = 0.0
-        offer_discount = 0.0
-        delivery_fee_discount = 0.0
-        offer_code: str | None = None
+    item_discount = 0.0
+    offer_discount = 0.0
+    offer_code: str | None = None
 
-        if restaurant_coupons and isinstance(restaurant_coupons, dict):
-            raw_sections = restaurant_coupons.get("coupon_sections", [])
-            for section in raw_sections:
-                if not isinstance(section, dict):
+    if restaurant_coupons and isinstance(restaurant_coupons, dict):
+        # Swiggy lets only one coupon apply per order, so pick whichever
+        # applicable coupon yields the largest real cart discount rather
+        # than just the last one seen. Free-delivery-only coupons aren't
+        # counted here since we no longer fabricate a delivery fee for them
+        # to offset.
+        best_benefit = 0.0
+        for section in restaurant_coupons.get("coupon_sections", []):
+            if not isinstance(section, dict):
+                continue
+            for coupon in section.get("coupons", []):
+                if not isinstance(coupon, dict) or coupon.get("applicable") is not True:
                     continue
-                coupons = section.get("coupons", [])
-                for coupon in coupons:
-                    if isinstance(coupon, dict) and coupon.get("applicable") is True:
-                        code = coupon.get("id") or coupon.get("title") or coupon.get("code")
-                        if isinstance(code, str):
-                            offer_code = code
-                        title_lower = str(coupon.get("title", "")).lower()
-                        desc_lower = str(coupon.get("description", "")).lower()
-                        if "free delivery" in title_lower or "free delivery" in desc_lower:
-                            delivery_fee_discount = delivery_fee
+                parsed = parse_coupon_benefit(coupon, item_total, delivery_fee=0.0)
+                if parsed is None:
+                    continue
+                parsed_item_discount, parsed_offer_discount, _parsed_delivery_discount = parsed
+                benefit = parsed_item_discount + parsed_offer_discount
+                if benefit > best_benefit:
+                    best_benefit = benefit
+                    item_discount, offer_discount = parsed_item_discount, parsed_offer_discount
+                    code = coupon.get("id") or coupon.get("title") or coupon.get("code")
+                    offer_code = code if isinstance(code, str) else None
 
-        gst = round(0.05 * (item_total + packaging), 2) if item_total > 0 else 0.0
-        total_payable = round(
-            max(0.0, item_total - item_discount - offer_discount + delivery_fee - delivery_fee_discount + packaging + platform_fee + gst),
-            2,
-        )
+    total_payable = round(max(0.0, item_total - item_discount - offer_discount), 2)
 
-        pricing = PricingBreakdown(
-            item_total=item_total,
-            delivery_fee=delivery_fee,
-            packaging_charge=packaging,
-            platform_fee=platform_fee,
-            gst=gst,
-            item_discount=item_discount,
-            offer_discount=offer_discount,
-            offer_code=offer_code,
-            delivery_fee_discount=delivery_fee_discount,
-            final_payable_amount=total_payable,
-        )
-        return EvaluatedCandidate(
-            candidate_key=item.candidate_key,
-            restaurant_id=item.restaurant_id,
-            item_id=item.item_id,
-            pricing=pricing,
-            error=None,
-        )
+    pricing = PricingBreakdown(
+        item_total=item_total,
+        delivery_fee=0.0,
+        packaging_charge=0.0,
+        platform_fee=0.0,
+        gst=0.0,
+        item_discount=item_discount,
+        offer_discount=offer_discount,
+        offer_code=offer_code,
+        delivery_fee_discount=0.0,
+        final_payable_amount=total_payable,
+        is_estimated=True,
+        pricing_source="local_estimate",
+        fees_unavailable=True,
+    )
+    return EvaluatedCandidate(
+        candidate_key=item.candidate_key,
+        restaurant_id=item.restaurant_id,
+        item_id=item.item_id,
+        pricing=pricing,
+        error=None,
+    )
 
 
 @app.post("/api/evaluate", response_model=EvaluateResponse, response_model_by_alias=False)

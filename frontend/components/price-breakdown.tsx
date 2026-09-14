@@ -46,25 +46,17 @@ export function PriceBreakdown({ candidate, evaluated, onClose }: Props) {
         {/* pricing breakdown */}
         {hasPricing ? (
           <dl className="mt-6 space-y-3 text-sm">
+            {pricing.is_estimated && (
+              <p className="rounded-lg bg-amber-50 px-3 py-2 text-xs font-medium text-amber-800">
+                ⚠️ {pricing.fees_unavailable
+                  ? "Swiggy's real checkout pricing wasn't available. The numbers below are verified (real item price, real coupon discount) — delivery, packaging, platform fee, and GST are not shown because Swiggy gave us no real value for them."
+                  : "Estimated price — Swiggy's real checkout pricing wasn't available, so this is calculated locally and may differ from the app."}
+              </p>
+            )}
             <Row label="Item total" value={rupees(pricing.item_total)} />
             {pricing.item_discount > 0 && (
               <Row label="Item discount" value={`−${rupees(pricing.item_discount)}`} discount />
             )}
-            <Row label="Delivery fee" value={rupees(pricing.delivery_fee)} />
-            {pricing.delivery_fee_discount > 0 && (
-              <Row
-                label="Delivery fee discount"
-                value={`−${rupees(pricing.delivery_fee_discount)}`}
-                discount
-              />
-            )}
-            {pricing.packaging_charge > 0 && (
-              <Row label="Packaging charges" value={rupees(pricing.packaging_charge)} />
-            )}
-            {pricing.platform_fee > 0 && (
-              <Row label="Platform fee" value={rupees(pricing.platform_fee)} />
-            )}
-            {pricing.gst > 0 && <Row label="GST & restaurant charges" value={rupees(pricing.gst)} />}
             {pricing.offer_discount > 0 && (
               <Row
                 label={`Offer discount${pricing.offer_code ? ` (${pricing.offer_code})` : ""}`}
@@ -72,11 +64,36 @@ export function PriceBreakdown({ candidate, evaluated, onClose }: Props) {
                 discount
               />
             )}
+            {!pricing.fees_unavailable && (
+              <>
+                <Row label="Delivery fee" value={rupees(pricing.delivery_fee)} />
+                {pricing.delivery_fee_discount > 0 && (
+                  <Row
+                    label="Delivery fee discount"
+                    value={`−${rupees(pricing.delivery_fee_discount)}`}
+                    discount
+                  />
+                )}
+                {pricing.packaging_charge > 0 && (
+                  <Row label="Packaging charges" value={rupees(pricing.packaging_charge)} />
+                )}
+                {pricing.platform_fee > 0 && (
+                  <Row label="Platform fee" value={rupees(pricing.platform_fee)} />
+                )}
+                {pricing.gst > 0 && <Row label="GST & restaurant charges" value={rupees(pricing.gst)} />}
+              </>
+            )}
             <Row
-              label="Final payable amount"
+              label={pricing.fees_unavailable ? "Item cost after discount (excl. fees)" : "Final payable amount"}
               value={rupees(pricing.final_payable_amount)}
               emphasis
             />
+            {pricing.fees_unavailable && (
+              <p className="text-xs text-stone-500">
+                Delivery, packaging, platform fee & GST apply on top of this at Swiggy&apos;s real
+                checkout and aren&apos;t included above.
+              </p>
+            )}
           </dl>
         ) : evaluated?.error ? (
           <div className="mt-6 rounded-2xl border border-red-200 bg-red-50 p-4">
